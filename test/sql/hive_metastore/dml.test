@@ -1,0 +1,162 @@
+# name: test/sql/hive_metastore/dml.test
+# description: INSERT, CREATE TABLE AS and SELECT over Hive tables in a Hive metastore catalog, partition pruning and
+# group: [hive_metastore]
+
+# the partition functions
+
+require parquet
+
+require json
+
+require hive
+
+require-env HIVE_METASTORE_URI
+
+require-env HIVE_WAREHOUSE
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_LOCATION '{HIVE_WAREHOUSE}');
+
+statement ok
+DROP SCHEMA IF EXISTS hms.hms_dml CASCADE;
+
+statement ok
+CREATE SCHEMA hms.hms_dml;
+
+statement ok
+CREATE TABLE hms.hms_dml.orders (id INTEGER, amount DOUBLE, region VARCHAR, dt VARCHAR) PARTITIONED BY (region, dt);
+
+statement ok
+INSERT INTO hms.hms_dml.orders VALUES (1, 10, 'eu', '2024-01-01'), (2, 20, 'eu', '2024-01-02'), (3, 30, 'us', '2024-01-01');
+
+statement ok
+INSERT INTO hms.hms_dml.orders VALUES (4, 40, 'eu', '2024-01-01');
+
+query IRTT
+SELECT * FROM hms.hms_dml.orders ORDER BY id;
+----
+1	10.0	eu	2024-01-01
+2	20.0	eu	2024-01-02
+3	30.0	us	2024-01-01
+4	40.0	eu	2024-01-01
+
+query TTT
+SELECT region, dt, location LIKE '%/orders/region=' || region || '/dt=' || dt FROM hive_partitions('hms.hms_dml.orders') ORDER BY ALL;
+----
+eu	2024-01-01	true
+eu	2024-01-02	true
+us	2024-01-01	true
+
+# only the partitions the filter keeps are read
+query II
+SELECT count(*), sum(id) FROM hms.hms_dml.orders WHERE region = 'eu' AND dt = '2024-01-01';
+----
+2	5
+
+query I
+SELECT count(DISTINCT filename) FROM hms.hms_dml.orders WHERE region = 'eu';
+----
+3
+
+# partition DDL
+statement ok
+CALL hive_add_partition('hms.hms_dml.orders', {region: 'apac', dt: '2024-01-01'});
+
+query TT
+SELECT region, dt FROM hive_partitions('hms.hms_dml.orders') WHERE region = 'apac';
+----
+apac	2024-01-01
+
+statement error
+CALL hive_add_partition('hms.hms_dml.orders', {region: 'apac', dt: '2024-01-01'});
+----
+already exists
+
+statement ok
+CALL hive_add_partition('hms.hms_dml.orders', {region: 'apac', dt: '2024-01-01'}, if_not_exists := true);
+
+query I
+SELECT count(*) FROM hms.hms_dml.orders WHERE region = 'apac';
+----
+0
+
+statement ok
+CALL hive_rename_partition('hms.hms_dml.orders', {region: 'apac', dt: '2024-01-01'}, {region: 'apac', dt: '2024-02-01'});
+
+query TT
+SELECT region, dt FROM hive_partitions('hms.hms_dml.orders') WHERE region = 'apac';
+----
+apac	2024-02-01
+
+statement ok
+CALL hive_drop_partition('hms.hms_dml.orders', {region: 'apac', dt: '2024-02-01'});
+
+query I
+SELECT count(*) FROM hive_partitions('hms.hms_dml.orders') WHERE region = 'apac';
+----
+0
+
+statement ok
+CALL hive_drop_partition('hms.hms_dml.orders', {region: 'apac', dt: '2024-02-01'}, if_exists := true);
+
+# dropping a partition leaves its files, but the scan no longer reads them
+statement ok
+CALL hive_drop_partition('hms.hms_dml.orders', {region: 'us', dt: '2024-01-01'});
+
+query I
+SELECT sum(id) FROM hms.hms_dml.orders;
+----
+7
+
+# the files of a partition registered again are read again
+statement ok
+CALL hive_add_partition('hms.hms_dml.orders', {region: 'us', dt: '2024-01-01'});
+
+query I
+SELECT sum(id) FROM hms.hms_dml.orders;
+----
+10
+
+query T
+SELECT partition_values FROM hive_get_partition_response('hms.hms_dml.orders', {region: 'eu', dt: '2024-01-02'});
+----
+[eu, 2024-01-02]
+
+# CREATE TABLE AS, in the text formats as well
+statement ok
+CREATE TABLE hms.hms_dml.eu_orders WITH (format = 'csv') AS SELECT id, amount FROM hms.hms_dml.orders WHERE region = 'eu';
+
+query IR
+SELECT * FROM hms.hms_dml.eu_orders ORDER BY id;
+----
+1	10.0
+2	20.0
+4	40.0
+
+statement ok
+CREATE TABLE hms.hms_dml.json_orders WITH (format = 'json') AS SELECT id, region FROM hms.hms_dml.orders WHERE id < 3;
+
+query IT
+SELECT * FROM hms.hms_dml.json_orders ORDER BY id;
+----
+1	eu
+2	eu
+
+statement error
+CREATE TABLE hms.hms_dml.eu_orders AS SELECT 1 AS id;
+----
+already exists
+
+# writes are refused for what DuckDB does not write
+statement error
+UPDATE hms.hms_dml.orders SET amount = 0;
+----
+UPDATE is not supported
+
+statement error
+DELETE FROM hms.hms_dml.orders;
+----
+DELETE is not supported
+
+statement ok
+DROP SCHEMA hms.hms_dml CASCADE;

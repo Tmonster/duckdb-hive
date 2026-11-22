@@ -1,0 +1,56 @@
+#pragma once
+
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/profiler.hpp"
+#include "duckdb/logging/log_type.hpp"
+
+namespace duckdb {
+class DatabaseInstance;
+struct CreateMacroInfo;
+
+//! What a scan of a Hive table spends its time on, one entry per 'event': 'partitions' (loading them),
+//! 'plan' (the listings to do), 'listing' (one of them) and 'sample' (the cardinality sample). 'scan_id' tells the
+//! scans of one query apart. Fields an event does not set are NULL. 'prefetch' (scan_id 0) is the partitions of
+//! several tables loaded concurrently once a statement is bound: 'table' the tables, 'detail' the outcome.
+//! One step of a Hive scan, logged as HiveScan. Its timer starts when the event is made; Finish() records the time
+//! since.
+struct HiveScanEvent {
+	HiveScanEvent(string table_p, idx_t scan_id_p, string event_p)
+	    : table(std::move(table_p)), scan_id(scan_id_p), event(std::move(event_p)) {
+		timer.Start();
+	}
+
+	//! Sets duration_ms to the time since the event was made
+	void Finish() {
+		timer.End();
+		duration_ms = timer.Elapsed() * 1000;
+	}
+
+	string table;
+	idx_t scan_id;
+	string event;
+	optional_idx partitions;
+	optional_idx partitions_read;
+	optional_idx listings;
+	optional_idx files;
+	double duration_ms = -1;
+	string detail;
+
+private:
+	Profiler timer;
+};
+
+class HiveScanLogType : public LogType {
+public:
+	static constexpr const char *NAME = "HiveScan";
+	static constexpr LogLevel LEVEL = LogLevel::LOG_INFO;
+
+	HiveScanLogType();
+
+	static LogicalType GetLogType();
+	static string ConstructLogMessage(const HiveScanEvent &event);
+};
+
+void RegisterHiveLogTypes(DatabaseInstance &db);
+
+} // namespace duckdb

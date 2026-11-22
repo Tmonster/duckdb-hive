@@ -1,0 +1,60 @@
+# name: test/sql/hive_metastore/views.test
+# description: Views in a Hive metastore catalog
+# group: [hive_metastore]
+
+require parquet
+
+require hive
+
+require-env HIVE_METASTORE_URI
+
+require-env HIVE_WAREHOUSE
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_LOCATION '{HIVE_WAREHOUSE}');
+
+statement ok
+DROP SCHEMA IF EXISTS hms.hms_views CASCADE;
+
+statement ok
+CREATE SCHEMA hms.hms_views;
+
+statement ok
+CREATE TABLE hms.hms_views.numbers AS SELECT range AS n FROM range(10);
+
+statement ok
+CREATE VIEW hms.hms_views.evens AS SELECT n FROM hms.hms_views.numbers WHERE n % 2 = 0;
+
+query I
+SELECT sum(n) FROM hms.hms_views.evens;
+----
+20
+
+query TT
+SELECT metastore_table_type, contains(response.ViewOriginalText::VARCHAR, 'hms_views.numbers') FROM hive_get_table_response('hms.hms_views.evens');
+----
+VIRTUAL_VIEW	true
+
+statement ok
+CREATE OR REPLACE VIEW hms.hms_views.evens AS SELECT n FROM hms.hms_views.numbers WHERE n % 2 = 0 AND n > 4;
+
+query I
+SELECT sum(n) FROM hms.hms_views.evens;
+----
+14
+
+statement error
+CREATE VIEW hms.hms_views.evens AS SELECT 1;
+----
+already exists
+
+statement ok
+DROP VIEW hms.hms_views.evens;
+
+statement error
+SELECT * FROM hms.hms_views.evens;
+----
+does not exist
+
+statement ok
+DROP SCHEMA hms.hms_views CASCADE;

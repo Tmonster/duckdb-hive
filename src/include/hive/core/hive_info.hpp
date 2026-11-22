@@ -1,0 +1,227 @@
+#pragma once
+
+#include "duckdb/common/enums/file_compression_type.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/typedefs.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/common/unordered_map.hpp"
+
+#include "hive/core/hive_table_format.hpp"
+#include "hive/core/hive_serde.hpp"
+#include "hive/core/readers/hive_csv_options.hpp"
+#include "hive/core/readers/hive_json_options.hpp"
+
+namespace duckdb {
+
+//! A table / partition as the metastore returned it, kept with the projection so that a write can be built from it
+//! instead of fetching the object again. Each metastore derives its own.
+struct HiveFetchedTable {
+	virtual ~HiveFetchedTable() = default;
+};
+struct HiveFetchedPartition {
+	virtual ~HiveFetchedPartition() = default;
+};
+
+enum class HiveSortOrder : uint8_t { UNSORTED, ASCENDING, DESCENDING };
+
+struct HiveColumn {
+	string name;
+	//! The Hive type string, e.g. 'int', 'decimal(10,2)', 'array<string>'
+	string type;
+	string comment;
+	//! Only set for entries of HiveTableInfo::sort_columns
+	HiveSortOrder sort_order = HiveSortOrder::UNSORTED;
+
+public:
+	//! 'ASC', 'DESC', or empty when unsorted
+	string DescribeSortOrder() const;
+};
+
+//! A metastore database, exposed as a DuckDB schema
+struct HiveDatabaseInfo {
+	//! the catalog the database resides in
+	string catalog_id;
+	string name;
+	string description;
+	//! Optional S3 location tables of this database default to
+	string location_uri;
+	unordered_map<string, string> parameters;
+};
+
+//! The file format of a Hive table's data files, decided by its SerDe
+enum class HiveFileFormat : uint8_t { PARQUET, CSV, JSON, AVRO };
+string HiveFileFormatToString(HiveFileFormat format);
+//! Whether the data files are text files (csv, json), whose codec the table records rather than the files themselves
+bool IsTextFileFormat(HiveFileFormat format);
+//! Parse 'parquet' | 'csv' | 'json' | 'avro' (case-insensitive), throws for anything else
+HiveFileFormat HiveFileFormatFromString(const string &format);
+
+HiveFileFormat HiveSerDeFileFormat(HiveSerDe serde);
+
+//! The metastore's TableType, as far as this extension decides anything on it. The field is a free string
+//! (EXTERNAL_TABLE, VIRTUAL_VIEW, GOVERNED, whatever a writer sets), so anything else is OTHER and the raw value is
+//! kept alongside.
+enum class HiveTableType : uint8_t { EXTERNAL_TABLE, VIRTUAL_VIEW, OTHER };
+HiveTableType HiveTableTypeFromString(const string &type);
+
+//! A metastore table
+struct HiveTableInfo {
+	string name;
+	//! The schema name of the table in the attached Hive catalog
+	string schema_name;
+	//! Table.DatabaseName as the metastore returned it
+	string hive_database_name;
+	//! The metastore's TableType as written (EXTERNAL_TABLE, VIRTUAL_VIEW, ...), not the open table format
+	string hive_table_type;
+	HiveTableType table_type = HiveTableType::OTHER;
+	//! ViewOriginalText / ViewExpandedText of a VIRTUAL_VIEW
+	string view_original_text;
+	string view_expanded_text;
+	//! Table Description
+	string description;
+	//! StorageDescriptor.Location
+	string location;
+	string input_format;
+	string output_format;
+	//! StorageDescriptor.SerdeInfo: decides how the data files are read
+	string serde_library;
+	unordered_map<string, string> serde_parameters;
+	vector<HiveColumn> columns;
+	vector<HiveColumn> partition_keys;
+	//! StorageDescriptor.BucketColumns / NumberOfBuckets / SortColumns
+	vector<string> bucket_columns;
+	//! -1 if unbucketed or the metastore did not record it, 0 for Hive's unbucketed. Neither implies the table
+	//! is unbucketed on its own - see IsBucketed.
+	int32_t number_of_buckets = -1;
+	//! StorageDescriptor.SortColumns, in the metastore's order; only name and sort_order are set
+	vector<HiveColumn> sort_columns;
+	unordered_map<string, string> parameters;
+	//! The metastore's version and create time of a fetched table; a DROP + CREATE starts at the same version again,
+	//! CreateTime (and TableType, within one second) tells the two apart. Empty for a definition not fetched from the
+	//! metastore.
+	string version_id;
+	int64_t create_time_ms = 0;
+	//! The file format to create the table with (CreateHiveTable); for a fetched table use GetFileFormat()
+	HiveFileFormat file_format = HiveFileFormat::PARQUET;
+	//! The Table object this projection was made from; null for a definition not fetched from the metastore
+	shared_ptr<const HiveFetchedTable> fetched;
+
+public:
+	bool IsView() const {
+		return table_type == HiveTableType::VIRTUAL_VIEW;
+	}
+	//! The table format and what it was derived from (MetastoreTableFormat::Detect)
+	MetastoreTableFormat GetFormat() const;
+	//! Whether 'other' is the same metastore version of the table; false when either version is unknown
+	bool IsSameVersion(const HiveTableInfo &other) const;
+	//! The 'metadata_location' parameter of an Iceberg table (empty if not present)
+	string GetMetadataLocation() const;
+	//! Look up a table parameter (case-insensitive key), returns empty string if missing
+	string GetParameter(const string &key) const;
+	bool IsBucketed() const;
+	//! Whether this is a partitioned table with Athena partition projection on (projection.enabled): Athena then
+	//! derives the partitions from the projection.* parameters and ignores the ones registered in the metastore
+	bool IsPartitionProjected() const;
+	//! Hive-style description of the bucketing, used in error messages
+	string DescribeBucketing() const;
+	//! The SerDe, derived from serde_library; throws NotImplementedException for other SerDes
+	HiveSerDe GetSerDe() const;
+	//! The file format of the data files, derived from the SerDe; throws NotImplementedException for other SerDes
+	HiveFileFormat GetFileFormat() const;
+	//! A property of the table as Hive hands it to the SerDe: a table parameter, else a SerDe parameter
+	bool TryGetProperty(const string &key, string &result) const;
+	//! separatorChar for OpenCSVSerde, else field.delim, serialization.format or '\001'
+	string GetFieldDelimiter() const;
+	//! The codec to write a csv / json table's files with (write.compression, else write_compression, else
+	//! compressionType), uncompressed when the table names none; throws for a codec DuckDB can not write. Files are
+	//! read with the codec their extension says, whatever the table records.
+	FileCompressionType GetTextCompression() const;
+	//! The codec the table records for its files, as DuckDB's writer for 'format' names it ('null' for an uncompressed
+	//! avro file), empty when it records none; throws for a codec DuckDB can not write
+	string GetCodec(HiveFileFormat format) const;
+	//! The format's codec parameter 'key', else write_compression, empty when the table records neither
+	string GetCodecParameter(const string &key) const;
+	//! compression_level, empty when the table does not say
+	string GetCompressionLevel() const;
+	//! serialization.null.format ('\N' by default); empty for OpenCSVSerde
+	string GetNullFormat() const;
+	//! skip.header.line.count, 0 without
+	idx_t GetHeaderLineCount() const;
+	//! Throws for text tables DuckDB can not read or write: footer lines, JSON header lines, nested csv columns, ...
+	void CheckTextSerdeSupported(HiveFileFormat format) const;
+	//! OpenCSVSerde's quoteChar ('"' by default); empty for LazySimpleSerDe, which does not quote
+	string GetQuoteCharacter() const;
+	//! OpenCSVSerde's escapeChar, else its quote character; LazySimpleSerDe's escape.delim (empty without)
+	string GetEscapeCharacter() const;
+	//! How the files of a csv table are read
+	HiveCSVOptions GetCSVOptions() const;
+	//! How the files of a json table are read
+	HiveJSONOptions GetJSONOptions() const;
+	//! The definition of the external table DuckDB creates from this one: the storage descriptor (InputFormat,
+	//! OutputFormat, SerDe) and table parameters Hive, Athena and Spark expect for 'file_format'
+	HiveTableInfo ForCreate() const;
+
+private:
+	//! A non-negative integer property, 0 when not set
+	idx_t GetCountProperty(const string &key) const;
+	//! An OpenCSVSerde character property (its first character), 'fallback' when not set
+	string GetOpenCSVCharacter(const string &key, const string &fallback) const;
+};
+
+//! What CreateView / UpdateView write: a Hive style view (TableType VIRTUAL_VIEW) marked as written by DuckDB
+struct HiveViewInfo {
+	//! The Hive database (a DuckDB schema) the view lives in
+	string database_name;
+	string name;
+	//! ViewOriginalText: the SELECT as written
+	string sql;
+	//! ViewExpandedText: tables as <db>.<table>, of other Hive catalogs by catalog id (executed)
+	string expanded_sql;
+	//! The bound output columns
+	vector<HiveColumn> columns;
+	bool secure = false;
+	bool has_column_alias_list = false;
+
+public:
+	//! Set the parameters that mark a view as written by DuckDB, keeping the others
+	void SetParameters(unordered_map<string, string> &parameters) const;
+};
+
+//! A partition of a Hive table to register: the partition values (in partition key order) and its location
+struct HivePartitionInput {
+	vector<string> values;
+	string location;
+};
+
+//! A partition of a Hive table as registered in the metastore: the partition values (in partition key order, as
+//! strings) and the location of its data files, which need not follow the <key>=<value> layout
+struct HivePartitionInfo {
+	vector<string> values;
+	string location;
+	//! The partition's own StorageDescriptor.InputFormat and SerdeInfo, which Hive reads its files with and which can
+	//! differ from the table's; empty when not known (a hive_scan)
+	string input_format;
+	string serde_library;
+	unordered_map<string, string> serde_parameters;
+	//! The data columns the partition declares, which can differ from the table's; empty when not known
+	vector<HiveColumn> partition_columns;
+	//! The column this partition declares for the table's column 'index', matched as a scan reads the files: by
+	//! position in csv tables, by name (ignoring case) otherwise. Null when the partition declares none, e.g. for a
+	//! column added to the table later.
+	optional_ptr<const HiveColumn> FindPartitionColumn(const vector<HiveColumn> &table_columns, idx_t index,
+	                                                   bool by_position) const;
+	//! The first data column of the table whose type this partition declares differently (FindPartitionColumn)
+	optional_idx FindColumnTypeMismatch(const vector<HiveColumn> &table_columns, bool by_position) const;
+};
+
+//! A partition as GetPartition returns it: also its parameters
+struct HivePartitionDetails : public HivePartitionInfo {
+	unordered_map<string, string> parameters;
+	//! The Partition object this projection was made from
+	shared_ptr<const HiveFetchedPartition> fetched;
+};
+
+} // namespace duckdb

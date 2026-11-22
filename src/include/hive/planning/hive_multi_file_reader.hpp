@@ -1,0 +1,267 @@
+#pragma once
+
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/multi_file/multi_file_list.hpp"
+#include "duckdb/common/multi_file/multi_file_reader.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/named_parameter_map.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/open_file_info.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/function/table_function.hpp"
+
+#include "hive/core/hive_info.hpp"
+
+namespace duckdb {
+class ExpressionFilter;
+
+//! Everything a Hive table scan knows before any data file is opened: the table schema as the metastore defines it, the
+//! partitions the metastore lists (values and locations) and the data files of every partition
+struct HiveScanInfo : public TableFunctionInfo {
+	//! Where the table comes from: a Hive table in the attached catalog catalog_name, or a hive_scan root
+	string catalog_name;
+	string database_name;
+	string table_name;
+	//! The Hive catalog table this scan reads, or null when the scan is a hive_scan over a location: reported
+	//! through the scan's get_table_entry
+	optional_ptr<TableCatalogEntry> table;
+	//! The table location: the data files of an unpartitioned table live directly below it, and it is the parent of
+	//! the <key>=<value> directories of partitions without an explicit location
+	string root_location;
+	//! The columns of the table: data columns first, partition keys last
+	vector<Identifier> names;
+	vector<LogicalType> types;
+	//! The file format of the data files
+	HiveFileFormat file_format = HiveFileFormat::PARQUET;
+	HiveCSVOptions csv_options;
+	HiveJSONOptions json_options;
+	//! The partition keys, in order
+	vector<string> partition_keys;
+	//! When set, the name of the secret every listed file is opened with, instead of the one that matches its path
+	string file_secret;
+	//! Numbers the scans of a query (HiveQueryCache::NextScanId), so the HiveScan log can tell them apart
+	idx_t scan_id = 0;
+	//! The partition (index into Partitions()) each listed data file belongs to. Filled in while the file list expands,
+	//! which can run concurrently with opening files.
+	mutable mutex file_partitions_lock;
+	unordered_map<string, idx_t> file_partitions;
+	//! The statistics function of the bound file format reader. BindHiveScan wraps it to answer partition columns from
+	//! the partition values, and every other column is delegated back to this. Null when the reader has none.
+	table_statistics_extended_t format_statistics = nullptr;
+	//! The cardinality function of the bound file format reader, used once the footers of every file are read
+	table_function_cardinality_t format_cardinality = nullptr;
+	//! The virtual columns function of the bound file format reader, which BindHiveScan extends with the metadata
+	//! columns
+	table_function_get_virtual_columns_t format_virtual_columns = nullptr;
+	//! The pushdown_complex_filter of the bound file format reader. For text formats BindHiveScan wraps it so filters
+	//! stay in the plan while filter_pushdown stays enabled for the join filters that prune partitions. Null when the
+	//! reader has none.
+	table_function_pushdown_complex_filter_t format_pushdown_complex_filter = nullptr;
+	//! The named parameters BindHiveScan bound the file format reader with, which read any of the data files
+	named_argument_map_t reader_parameters;
+
+	//! The index of a partition key by name, or DConstants::INVALID_INDEX
+	idx_t GetPartitionKeyIndex(const string &name) const;
+	//! The partition (index into 'partitions') the file at 'path' belongs to
+	idx_t GetPartitionIndexOfFile(const string &path) const;
+	//! The same, or nothing when the file list has not listed 'path'
+	optional_idx FindPartitionIndexOfFile(const string &path) const;
+	const HivePartitionInfo &GetPartitionOfFile(const string &path) const;
+	//! Throws unless the partition's own storage format reads its files as the scan's reader does: Hive reads every
+	//! partition with its own SerDe, and the scan binds one reader for the table
+	void VerifyConsistentPartitionSerDe(const HivePartitionInfo &partition) const;
+	//! The error VerifyConsistentPartitionSerDe throws for the partition, none when it reads like the table
+	ErrorData PartitionStorageMismatch(const HivePartitionInfo &partition) const;
+	//! The metastore registers a partition's data columns with their own types. Throws when a column the scan reads
+	//! ('column_indexes' into 'names') is declared by the partition with a type that can not be promoted to the
+	//! table's type, e.g. 'double' in the partition but 'int' in the table. Matched by position for csv, by name
+	//! otherwise
+	void CheckPartitionColumns(ClientContext &context, const HivePartitionInfo &partition,
+	                           const vector<idx_t> &column_indexes) const;
+	//! A description of the table for error messages
+	string Describe() const;
+	//! The key of the table in the query cache: a Hive table by name, a hive_scan by its location
+	string CacheKey() const;
+	//! Whether the optimizer gets the footers of every file for statistics: a small unpartitioned parquet scan
+	bool ReadsFooterStatistics() const;
+	//! A copy of 'bind_data' with the footers of all its files, or null when the scan has none. They are read when the
+	//! optimizer first asks, once per query and table, or per scan when path-filtered
+	unique_ptr<MultiFileBindData> FooterStatisticsBindData(ClientContext &context,
+	                                                       const MultiFileBindData &bind_data) const;
+	//! The partitions of the table: given at bind (hive_scan), or fetched from the metastore on first use and shared
+	//! with every scan of the table in the query. Never replaced once set, so indexes into it stay valid
+	shared_ptr<const vector<HivePartitionInfo>> Partitions(ClientContext &context) const;
+	bool PartitionsLoaded() const;
+	void SetPartitions(vector<HivePartitionInfo> partitions_p);
+	void SetPartitions(shared_ptr<const vector<HivePartitionInfo>> partitions_p);
+
+private:
+	string FootersCacheKey(bool path_filtered) const;
+	vector<shared_ptr<BaseUnionData>> ReadFooters(ClientContext &context, const MultiFileBindData &bind_data,
+	                                              idx_t max_files) const;
+
+private:
+	mutable annotated_mutex partitions_lock;
+	mutable shared_ptr<const vector<HivePartitionInfo>> partitions DUCKDB_GUARDED_BY(partitions_lock);
+};
+
+//! The data files of a Hive table, listed lazily: nothing is listed until the scan asks for files, and the filters on
+//! the partition columns are applied to the partition values first (HiveMultiFileReader::ComplexFilterPushdown), so
+//! only the partitions a query reads are ever listed. When at least 'hive_partition_listing_threshold' of those
+//! partitions live below the table root, the root is listed once (recursively, one request per 1000 keys on S3) and
+//! the files are matched to their partitions by prefix; otherwise, and for partitions elsewhere, every partition is
+//! one listing of its location, 16 at a time as tasks on DuckDB's threads. An unpartitioned table is one listing of the
+//! root location. A directory is listed once per query (scans and the sample share the listing); with
+//! hive_cache_listings the listings of Hive tables are kept for later statements of the connection as well.
+class HiveMultiFileList : public LazyMultiFileList {
+public:
+	//! 'partition_indexes' are the partitions to read
+	HiveMultiFileList(ClientContext &context, shared_ptr<HiveScanInfo> scan_info, vector<idx_t> partition_indexes);
+	//! Every partition of the table, resolved when PartitionIndexes() is first asked
+	HiveMultiFileList(ClientContext &context, shared_ptr<HiveScanInfo> scan_info);
+
+	//! The partitions to read, as indexes into HiveScanInfo::Partitions()
+	shared_ptr<const vector<idx_t>> PartitionIndexes() const;
+	const HiveScanInfo &ScanInfo() const {
+		return *scan_info;
+	}
+	ClientContext &Context() const {
+		return client_context;
+	}
+	FileExpandResult GetExpandResult() const override;
+	//! Prune on the table filters pushed in when the scan starts
+	unique_ptr<MultiFileList> DynamicFilterPushdown(MultiFileDynamicPushdownInfo &info) const override;
+	//! Keep files matching filters that depend only on "$path" or filename
+	void SetPathFilters(vector<shared_ptr<ExpressionFilter>> filters);
+	bool HasPathFilters() const {
+		return !path_filters.empty();
+	}
+	//! Without listing: the number of partitions still to read as a lower bound (NOT_ALL_FILES_KNOWN)
+	MultiFileCount GetFileCount(idx_t min_exact_count = 0) const override;
+	//! The data files listed to measure the table: the first partition's, or the location of an unpartitioned table.
+	//! The listing is kept until the query ends, and any scan listing the same directory in the query takes it from
+	//! there. When the scan lists the table root, the files of every partition the root's first page holds completely
+	//! instead (fetching more only until it holds one the scan reads), and the scan continues that listing.
+	vector<OpenFileInfo> ListSampleDirectory() const;
+	vector<OpenFileInfo> GetDisplayFileList(optional_idx max_files = optional_idx()) const override;
+	unique_ptr<MultiFileList> Copy() const override;
+
+protected:
+	bool ExpandNextPath() const override;
+
+private:
+	//! A listing we still have to do: either the table root (covering the partitions under it) or a batch of
+	//! partitions that each get their own listing
+	struct ListingJob {
+		bool root;
+		vector<idx_t> partitions;
+	};
+	//! Decide the listings from the partitions to read (once, under the lock)
+	void PlanListings() const;
+	void ListRoot(const vector<idx_t> &partitions) const;
+	//! Lists the directories of 'partition_indexes' in parallel
+	void ListPartitions(const vector<idx_t> &partition_indexes) const;
+	//! The files of the partitions the fetched pages of the root listing hold completely, fetching more only until
+	//! they hold one of 'partitions'
+	vector<OpenFileInfo> SampleRootPartitions(const vector<idx_t> &partitions) const;
+	//! Index every registered partition location, including pruned ones, so attribution does not depend on filters
+	void BuildPartitionLocations() const;
+	//! Refuse to read a file attributed to 'owner' when its location is one two or more partitions are registered at
+	//! and one of them is in 'reading'
+	void ThrowIfLocationShared(idx_t owner, const unordered_set<idx_t> &reading) const;
+	//! The partition of the deepest registered location containing the file, searching no shorter than
+	//! 'min_directory_size' characters of its ComparableLocation
+	optional_idx OwningPartition(const string &file_path, idx_t min_directory_size) const;
+	//! IsDataFile below the deepest registered partition location containing the file (see OwningPartition), or below
+	//! the root when there is none, so a partition key such as '_k' is not read as a hidden directory
+	bool IsRootListedDataFile(const OpenFileInfo &file, const string &root_prefix, idx_t comparable_root_size,
+	                          const vector<HivePartitionInfo> &partitions) const;
+	//! Add a listed file of the partition unless this list already has it. Called with
+	//! HiveScanInfo::file_partitions_lock held. 'partition_index' is invalid for an unpartitioned table.
+	void AddFile(OpenFileInfo file, optional_idx partition_index) const;
+
+private:
+	//! The context the list was created in; LazyMultiFileList keeps it as an optional_ptr that is const in const
+	//! members
+	ClientContext &client_context;
+	shared_ptr<HiveScanInfo> scan_info;
+	//! Filters whose only column is "$path" or filename, applied to listed files before any is opened
+	vector<shared_ptr<ExpressionFilter>> path_filters;
+	mutable annotated_mutex indexes_lock;
+	//! Null for every partition of the table until PartitionIndexes() resolves it
+	mutable shared_ptr<const vector<idx_t>> partition_indexes DUCKDB_GUARDED_BY(indexes_lock);
+	mutable bool planned = false;
+	mutable vector<ListingJob> listing_jobs;
+	//! The next entry of 'listing_jobs' to run
+	mutable idx_t next_job = 0;
+	//! The paths already in 'expanded_files'
+	mutable unordered_set<string> listed_files;
+	//! ComparableLocation of a registered partition location to its index in HiveScanInfo::Partitions(): the first
+	//! partition registered there
+	mutable unordered_map<string, idx_t> partition_by_location;
+	//! For a location two or more partitions are registered at: the first of them (its entry in partition_by_location,
+	//! which files there are attributed to) to all of them
+	mutable unordered_map<idx_t, vector<idx_t>> shared_locations;
+	mutable bool partition_locations_built = false;
+};
+
+//! Bind the reader for the file format (read_parquet, read_csv, read_json or read_avro) over the partitions of
+//! 'scan_info' with the HiveMultiFileReader. Returns the bound table function and fills in 'bind_data'; the scan
+//! produces exactly the columns of 'scan_info'. No file is listed or opened here.
+TableFunction BindHiveScan(ClientContext &context, shared_ptr<HiveScanInfo> scan_info,
+                           unique_ptr<FunctionData> &bind_data);
+//! Give 'function' the Hive scan's plan serialization. A deserialized plan binds the same scan again from it; a
+//! partitioned table's scan also needs the query's partition list, and is refused without it
+void SetHiveScanSerialization(TableFunction &function);
+
+//! MultiFileReader for Hive tables registered in the metastore. It reads the files the metastore's partitions point to
+//! (whatever their directory names), binds the schema the metastore defines rather than the schema of the first file (a
+//! column missing from a file reads as NULL, a differently typed column is cast) and fills the partition columns of
+//! every file with the values the metastore stores for its partition. Filters on partition columns prune whole
+//! partitions before any file is opened.
+class HiveMultiFileReader : public MultiFileReader {
+public:
+	//! Virtual column identifier for the "$path" column (the data file a row was read from, as filename)
+	static constexpr column_t COLUMN_IDENTIFIER_PATH = UINT64_C(9223372036854841344);
+	//! Virtual column identifier for the "$file_size" column (the size of the data file)
+	static constexpr column_t COLUMN_IDENTIFIER_FILE_SIZE = UINT64_C(9223372036854841345);
+	//! Virtual column identifier for the "$file_modified_time" column (the last modification time of the data file)
+	static constexpr column_t COLUMN_IDENTIFIER_FILE_MODIFIED_TIME = UINT64_C(9223372036854841346);
+
+	//! Add "$path", "$file_size" and "$file_modified_time"
+	static void AddMetadataColumns(virtual_column_map_t &result);
+
+public:
+	explicit HiveMultiFileReader(shared_ptr<HiveScanInfo> scan_info);
+
+	static unique_ptr<MultiFileReader> CreateInstance(const BoundTableFunction &table);
+
+	//! The scan info behind this reader, which the Hive scan's bind info delegates to the format reader and extends
+	const HiveScanInfo &ScanInfo() const;
+
+	unique_ptr<MultiFileReader> Copy() const override;
+	shared_ptr<MultiFileList> CreateFileList(ClientContext &context, const vector<string> &paths,
+	                                         const FileGlobInput &glob_input) override;
+	bool Bind(MultiFileOptions &options, MultiFileList &files, vector<LogicalType> &return_types,
+	          vector<Identifier> &names, MultiFileReaderBindData &bind_data) override;
+	void BindOptions(MultiFileOptions &options, MultiFileList &files, vector<LogicalType> &return_types,
+	                 vector<Identifier> &names, MultiFileReaderBindData &bind_data) override;
+	unique_ptr<MultiFileList> ComplexFilterPushdown(ClientContext &context, MultiFileList &files,
+	                                                const MultiFileOptions &options, MultiFilePushdownInfo &info,
+	                                                vector<unique_ptr<Expression>> &filters) override;
+	void FinalizeBind(MultiFileReaderData &reader_data, const MultiFileOptions &file_options,
+	                  const MultiFileReaderBindData &options, const vector<MultiFileColumnDefinition> &global_columns,
+	                  const vector<ColumnIndex> &global_column_ids, ClientContext &context,
+	                  optional_ptr<MultiFileReaderGlobalState> global_state) override;
+	ReaderInitializeType InitializeReader(MultiFileReaderData &reader_data, const MultiFileBindData &bind_data,
+	                                      const vector<MultiFileColumnDefinition> &global_columns,
+	                                      const vector<ColumnIndex> &global_column_ids,
+	                                      optional_ptr<TableFilterSet> table_filters, ClientContext &context,
+	                                      MultiFileGlobalState &gstate) override;
+
+private:
+	shared_ptr<HiveScanInfo> scan_info;
+};
+
+} // namespace duckdb

@@ -1,0 +1,223 @@
+#pragma once
+
+#include "duckdb/common/map.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/reference_map.hpp"
+#include "duckdb/common/shared_ptr.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unordered_set.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/transaction/transaction.hpp"
+
+#include "hive/metastore/hive_metastore.hpp"
+#include "hive/catalog/hive_entry_set.hpp"
+#include "hive/execution/hive_write.hpp"
+
+#include <functional>
+
+namespace duckdb {
+class HiveCatalog;
+class HiveSchemaEntry;
+class HiveView;
+class ViewCatalogEntry;
+
+enum class HiveTransactionState { TRANSACTION_NOT_YET_STARTED, TRANSACTION_STARTED, TRANSACTION_FINISHED };
+
+//! Metastore metadata resolved in this transaction
+class HiveTransactionCache {
+public:
+	//! The current transaction's cache, or null when no catalog transaction is active (ATTACH, bare mutations)
+	static optional_ptr<HiveTransactionCache> Of(ClientContext &context, Catalog &catalog);
+	//! Clears the connection's directory listings too
+	static void Invalidate(ClientContext &context, Catalog &catalog);
+	//! DETACH erases the catalog's entry from the detaching connection's cache state; the attach-identity
+	//! keying remains the safety net for connection states a DETACH cannot reach
+	static void OnDetach(ClientContext &context, Catalog &catalog);
+	//! Whether hive_metadata_cache_scope is 'connection'
+	static bool ConnectionScoped(ClientContext &context);
+	//! Clear the cache when the enclosing metastore mutation returns or throws
+	struct InvalidateOnExit {
+		InvalidateOnExit(ClientContext &context, Catalog &catalog) : context(context), catalog(catalog) {
+		}
+		//! Invalidates; an exception is logged, not rethrown (defined in hive_transaction.cpp for the logger)
+		~InvalidateOnExit();
+		ClientContext &context;
+		Catalog &catalog;
+	};
+
+	shared_ptr<const HiveTableInfo> GetTable(const string &database_name, const string &table_name,
+	                                         const std::function<shared_ptr<const HiveTableInfo>()> &load) {
+		shared_ptr<CacheEntry<HiveTableInfo>> entry;
+		{
+			annotated_lock_guard<annotated_mutex> guard(lock);
+			entry = FindEntry(tables, TableCacheKey(database_name, table_name));
+		}
+		return Resolve(*entry, load);
+	}
+	shared_ptr<const vector<HivePartitionInfo>>
+	GetPartitions(const string &database_name, const string &table_name,
+	              const std::function<shared_ptr<const vector<HivePartitionInfo>>()> &load) {
+		shared_ptr<CacheEntry<vector<HivePartitionInfo>>> entry;
+		{
+			annotated_lock_guard<annotated_mutex> guard(lock);
+			entry = FindEntry(partitions, TableCacheKey(database_name, table_name));
+		}
+		return Resolve(*entry, load);
+	}
+	void Clear() {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		tables.clear();
+		partitions.clear();
+		listed_sets.clear();
+	}
+	//! Tells cache instances apart (monotonic, never reused): a bulk table fetch warms each instance at most once
+	//! (HiveTableSet), and under the default scope a new transaction brings a new instance
+	idx_t Id() const {
+		return id;
+	}
+	//! Whether the entry set with this id was listed from the metastore under this cache; the listing holds until the
+	//! cache is cleared
+	bool HasListed(hive_entry_set_id_t set_id) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		return listed_sets.count(set_id) > 0;
+	}
+	void MarkListed(hive_entry_set_id_t set_id) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		listed_sets.insert(set_id);
+	}
+	//! Monotonic ids, never reused: for cache instances and for the entry sets they track
+	static idx_t NextId();
+	static string TableCacheKey(const string &database_name, const string &table_name) {
+		return database_name + "\x1f" + table_name;
+	}
+
+private:
+	//! One cached value and the lock that guards loading it. The lock is per entry so the metastore calls for
+	//! different tables do not wait on each other (resolving N tables runs their fetches in parallel).
+	template <class T>
+	struct CacheEntry {
+		annotated_mutex load_lock;
+		//! Null until a load succeeds; a failed load leaves it null so the next reference retries
+		shared_ptr<const T> value DUCKDB_GUARDED_BY(load_lock);
+	};
+
+	//! Keys fold case (Hive database/table names are case-insensitive). The map lock is only held to find or
+	//! create the entry (FindEntry); the entry's own lock is held across 'load' (Resolve) so concurrent references
+	//! to the same key fetch once while different keys load in parallel; 'load' must not call back into this cache
+	template <class T>
+	shared_ptr<CacheEntry<T>> FindEntry(unordered_map<string, shared_ptr<CacheEntry<T>>> &map, const string &key)
+	    DUCKDB_REQUIRES(lock) {
+		auto &slot = map[StringUtil::Lower(key)];
+		if (!slot) {
+			slot = make_shared_ptr<CacheEntry<T>>();
+		}
+		return slot;
+	}
+	template <class T>
+	static shared_ptr<const T> Resolve(CacheEntry<T> &entry, const std::function<shared_ptr<const T>()> &load) {
+		annotated_lock_guard<annotated_mutex> guard(entry.load_lock);
+		if (entry.value) {
+			return entry.value;
+		}
+		entry.value = load();
+		return entry.value;
+	}
+
+	annotated_mutex lock;
+	unordered_map<string, shared_ptr<CacheEntry<HiveTableInfo>>> tables DUCKDB_GUARDED_BY(lock);
+	unordered_map<string, shared_ptr<CacheEntry<vector<HivePartitionInfo>>>> partitions DUCKDB_GUARDED_BY(lock);
+	unordered_set<hive_entry_set_id_t> listed_sets DUCKDB_GUARDED_BY(lock);
+	const idx_t id = NextId();
+};
+
+//! The connection's caches under hive_metadata_cache_scope='connection', one per attached Hive catalog. Lives in
+//! the connection's registered state, so two connections never share a cache. A rollback clears the caches held
+//! here: a failed statement must not leave metadata it resolved behind.
+class HiveMetadataCacheState : public ClientContextState {
+public:
+	shared_ptr<HiveTransactionCache> GetCache(const string &catalog_name, idx_t attach_oid) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		auto &entry = caches[catalog_name];
+		// Keyed by the attach identity, not just the alias: after DETACH + re-ATTACH under the same alias the
+		// new attached database must not be served the old catalog's metadata, even where the DETACH hook
+		// (EraseCache) could not reach this state. Replacing the entry also keeps one entry per alias.
+		if (!entry.cache || entry.attach_oid != attach_oid) {
+			entry = {attach_oid, make_shared_ptr<HiveTransactionCache>()};
+		}
+		return entry.cache;
+	}
+
+	void EraseCache(const string &catalog_name, idx_t attach_oid) {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		auto entry = caches.find(catalog_name);
+		if (entry != caches.end() && entry->second.attach_oid == attach_oid) {
+			caches.erase(entry);
+		}
+	}
+
+	void ClearAll() {
+		annotated_lock_guard<annotated_mutex> guard(lock);
+		for (auto &entry : caches) {
+			entry.second.cache->Clear();
+		}
+	}
+
+	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override {
+		ClearAll();
+	}
+
+private:
+	struct CatalogCache {
+		idx_t attach_oid;
+		shared_ptr<HiveTransactionCache> cache;
+	};
+
+	annotated_mutex lock;
+	unordered_map<string, CatalogCache> caches DUCKDB_GUARDED_BY(lock);
+};
+
+//! The metastore has no transactional semantics in this extension: every DDL statement is executed against the
+//! metastore immediately. The transaction exists because every attached database needs one, and carries the metadata
+//! cache. It also keeps the Hive writes of the running statement: a write that is still there when the transaction ends
+//! belongs to a statement that failed, and is undone (UndoHiveWrite).
+class HiveTransaction : public Transaction {
+public:
+	HiveTransaction(HiveCatalog &hive_catalog, TransactionManager &manager, ClientContext &context);
+	~HiveTransaction() override;
+
+	void Start();
+	void Commit();
+	void Rollback();
+
+	static HiveTransaction &Get(ClientContext &context, Catalog &catalog);
+
+	//! A Hive write starts: it is undone when the transaction ends before CompleteHiveWrite. Writes are refused in
+	//! explicit transactions, so a transaction holds at most one
+	void AddHiveWrite(HiveWrite write);
+	//! The write, or null when it was not added or has completed; the pointer stays valid until then
+	optional_ptr<HiveWrite> FindHiveWrite(const string &write_id);
+	//! The write's files are written and its partitions registered, nothing to undo
+	void CompleteHiveWrite(const string &write_id);
+
+public:
+	HiveCatalog &hive_catalog;
+	//! Per transaction by default; shared through the connection state under hive_metadata_cache_scope='connection'
+	//! (so a prepared statement's two binds share it).
+	shared_ptr<HiveTransactionCache> cache;
+	//! Hive views with their Iceberg tables bound in the catalog the attach option ICEBERG_CATALOG names, per alias
+	//! mapping and Iceberg catalog; null when the view reads no Iceberg table
+	mutex iceberg_views_lock;
+	reference_map_t<HiveView, map<string, unique_ptr<ViewCatalogEntry>>> iceberg_views;
+
+private:
+	//! Undo the write if it did not complete (HiveWrite::Undo); nothing is done once the connection is gone
+	void UndoHiveWrite();
+
+	HiveTransactionState transaction_state;
+	annotated_mutex hive_write_lock;
+	unique_ptr<HiveWrite> hive_write DUCKDB_GUARDED_BY(hive_write_lock);
+};
+
+} // namespace duckdb

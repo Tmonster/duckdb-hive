@@ -1,0 +1,58 @@
+# Runs the sqllogictests against a metastore kept in a DuckDB database (no servers) and against a Hive Metastore with
+# S3 (scripts/hive_metastore/docker-compose.yml). A release build with DuckDB's assertions on.
+
+name: Local Hive tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  local-hive-tests:
+    runs-on: ubuntu-24.04
+
+    env:
+      GEN: ninja
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        uses: ./duckdb/.github/actions/cleanup_runner
+
+      - uses: docker/setup-compose-action@v1
+
+      - name: Start the Hive Metastore and its S3
+        run: make hive-fixture
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build
+
+      - name: Setup Ccache
+        uses: ./duckdb/.github/actions/ccache-action
+        with:
+          save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        uses: duckdb/duckdb-ci/build-duckdb@main
+        with:
+          build-type: release
+          build: make release EXT_RELEASE_FLAGS="-DFORCE_ASSERT=1"
+          vcpkg-commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # Release 2026.06.2
+
+      - name: Run tests (DuckDB metastore)
+        run: make test-hive-duckdb
+
+      - name: Run tests (Hive Metastore)
+        run: make test-hms
+
+      - name: Metastore logs
+        if: always()
+        run: docker compose -f scripts/hive_metastore/docker-compose.yml logs --no-color metastore | tail -200

@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<configuration>
+  <property><name>metastore.warehouse.dir</name><value>s3://hive-test/managed</value></property>
+  <property><name>metastore.warehouse.external.dir</name><value>s3://hive-test/warehouse</value></property>
+  <property><name>hive.metastore.event.db.notification.api.auth</name><value>false</value></property>
+</configuration>
