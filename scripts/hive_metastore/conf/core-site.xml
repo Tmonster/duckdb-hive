@@ -1,12 +1,5 @@
 <?xml version="1.0"?>
 <configuration>
-  <!-- s3:// locations as the tests write them, through S3A against the SeaweedFS of the compose file -->
-  <property><name>fs.s3.impl</name><value>org.apache.hadoop.fs.s3a.S3AFileSystem</value></property>
-  <property><name>fs.s3a.endpoint</name><value>http://s3:8333</value></property>
-  <property><name>fs.s3a.path.style.access</name><value>true</value></property>
-  <property><name>fs.s3a.connection.ssl.enabled</name><value>false</value></property>
-  <property><name>fs.s3a.access.key</name><value>minio</value></property>
-  <property><name>fs.s3a.secret.key</name><value>minio123</value></property>
-  <property><name>fs.s3a.endpoint.region</name><value>us-east-1</value></property>
-  <property><name>fs.s3a.aws.credentials.provider</name><value>org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider</value></property>
+  <!-- the directories the metastore creates are written by DuckDB, which runs as another user -->
+  <property><name>fs.permissions.umask-mode</name><value>000</value></property>
 </configuration>

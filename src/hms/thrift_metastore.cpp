@@ -126,6 +126,17 @@ ThriftValue ToThriftColumns(const vector<HiveColumn> &columns) {
 	return result;
 }
 
+//! Hadoop qualifies a local location as file:/path or file:///path; DuckDB lists and names local files by their path
+string LocalPath(const string &location) {
+	if (StringUtil::StartsWith(location, "file:///")) {
+		return location.substr(7);
+	}
+	if (StringUtil::StartsWith(location, "file:/")) {
+		return location.substr(5);
+	}
+	return location;
+}
+
 //! Hive keeps names in lower case
 string ThriftName(const string &name) {
 	return StringUtil::Lower(name);
@@ -135,7 +146,7 @@ HiveDatabaseInfo DatabaseFromThrift(const ThriftValue &value) {
 	HiveDatabaseInfo result;
 	result.name = value.GetString(database::NAME);
 	result.description = value.GetString(database::DESCRIPTION);
-	result.location_uri = value.GetString(database::LOCATION_URI);
+	result.location_uri = LocalPath(value.GetString(database::LOCATION_URI));
 	result.parameters = value.GetStringMap(database::PARAMETERS);
 	return result;
 }
@@ -155,7 +166,7 @@ HiveTableInfo TableFromThrift(const ThriftValue &value, const string &schema_nam
 		result.description = comment->second;
 	}
 	auto &sd = value.Field(table::SD);
-	result.location = sd.GetString(storage_descriptor::LOCATION);
+	result.location = LocalPath(sd.GetString(storage_descriptor::LOCATION));
 	result.input_format = sd.GetString(storage_descriptor::INPUT_FORMAT);
 	result.output_format = sd.GetString(storage_descriptor::OUTPUT_FORMAT);
 	auto &serde = sd.Field(storage_descriptor::SERDE_INFO);
@@ -187,7 +198,7 @@ HivePartitionDetails PartitionFromThrift(const ThriftValue &value) {
 	HivePartitionDetails result;
 	result.values = value.GetStringList(partition::VALUES);
 	auto &sd = value.Field(partition::SD);
-	result.location = sd.GetString(storage_descriptor::LOCATION);
+	result.location = LocalPath(sd.GetString(storage_descriptor::LOCATION));
 	result.input_format = sd.GetString(storage_descriptor::INPUT_FORMAT);
 	auto &serde = sd.Field(storage_descriptor::SERDE_INFO);
 	result.serde_library = serde.GetString(serde_info::SERIALIZATION_LIB);

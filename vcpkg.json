@@ -1,7 +1,5 @@
 {
 	"dependencies": [
-		"openssl",
-		"curl",
 		"zlib",
 		"snappy",
 		"liblzma",

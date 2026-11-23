@@ -71,8 +71,13 @@ a `--test-config` they are skipped.
 
 - `test/configs/local_hive_duckdb.json`: a metastore kept in a DuckDB file in the test directory and tables on the local
   file system, no servers: `make test-hive-duckdb`.
-- `test/configs/local_hms.json`: Apache Hive's metastore (4.0.1, Derby inside) and SeaweedFS (S3) from
+- `test/configs/local_hms.json`: Apache Hive's metastore (4.0.1, Derby inside) from
   `scripts/hive_metastore/docker-compose.yml`: `make hive-fixture`, `make test-hms`, `make hive-fixture-down`. The
-  metastore keeps its state between runs, so the tests drop their databases first.
+  tables live on the local file system below `/tmp/duckdb-hive-warehouse`, which is mounted at the same path in the
+  container, as the metastore creates the directories of what it registers. The metastore keeps its state between
+  runs, so the tests drop their databases first.
+
+CI (`.github/workflows/LocalHiveTests.yml`) runs each config in a job of its own; only the Hive Metastore job starts
+containers.
 
 `TEST_BUILD=relassert` runs the tests of a `make relassert` build.

@@ -23,7 +23,7 @@ VCPKG_TOOLCHAIN_PATH='<vcpkg>/scripts/buildsystems/vcpkg.cmake' GEN=ninja make r
 A `relassert` build is ASAN-instrumented: run it with `ASAN_OPTIONS=detect_container_overflow=0`. Each `src/`
 subdirectory has its own `CMakeLists.txt` (an `add_library_unity` object library appended to `HIVE_EXTENSION_FILES`):
 add new `.cpp` files there, and a new directory with `add_subdirectory` in its parent. `extension_config.cmake` also
-builds `httpfs` (S3) and `avro` (loaded on demand for AvroSerDe tables).
+builds `avro` (loaded on demand for AvroSerDe tables).
 
 Run `make format-fix` (clang-format over `src` and `test`, via the duckdb submodule) before committing.
 
@@ -34,10 +34,14 @@ without a `--test-config` they are skipped (`require-env HIVE_METASTORE_URI`).
 
 - `test/configs/local_hive_duckdb.json`: a DuckDB-file metastore in the test directory, tables on the local file system,
   no servers (`make test-hive-duckdb`).
-- `test/configs/local_hms.json`: Apache Hive's metastore + SeaweedFS from `scripts/hive_metastore/docker-compose.yml`
-  (`make hive-fixture`, `make test-hms`, `make hive-fixture-down`). The compose project is `duckdb-hive-metastore`
-  (ports 9083/9200). The metastore keeps its state between runs: tests `DROP SCHEMA IF EXISTS ... CASCADE` their
-  databases first. Tests only for one backend use `require-env HIVE_TEST_CONFIG duckdb|thrift`.
+- `test/configs/local_hms.json`: Apache Hive's metastore from `scripts/hive_metastore/docker-compose.yml`
+  (`make hive-fixture`, `make test-hms`, `make hive-fixture-down`; compose project `duckdb-hive-metastore`, port 9083).
+  Tables are local files below `/tmp/duckdb-hive-warehouse`, mounted at the same path in the container (the metastore
+  creates their directories; `fs.permissions.umask-mode` 000 lets DuckDB write into them). Hadoop's `file:` locations
+  are read back as plain paths (`LocalPath` in `thrift_metastore.cpp`). The metastore keeps its state between runs:
+  tests `DROP SCHEMA IF EXISTS ... CASCADE` their databases first.
+
+Tests only for one backend use `require-env HIVE_TEST_CONFIG duckdb|thrift`.
 
 Test targets don't build first (`TEST_BUILD=release` by default). Test format is DuckDB's sqllogictest. Do not add
 `PRAGMA enable_verification`. Test error paths, not just the happy path.
@@ -65,7 +69,8 @@ Test targets don't build first (`TEST_BUILD=release` by default). Test format is
   partition directories and register new partitions in Finalize; a failed statement's write is undone by
   `HiveTransaction::Rollback` (`HiveWrite::Undo`), using the `HiveMetastoreHandle` taken while the statement ran.
 - **Partition DDL** `src/hive/functions/hive_partition_functions.cpp` (`hive_partitions`, `hive_add_partition`, ...,
-  `hive_alter_table`); `src/hive/grammar/hive_grammar.cpp` rewrites Hive partition SQL into `CALL hive_alter_table(...)`.
+  `hive_alter_table`); `src/hive/grammar/hive_grammar.cpp` rewrites Hive partition SQL into `CALL
+  hive_alter_table(...)`.
 
 ## Coding guidelines
 

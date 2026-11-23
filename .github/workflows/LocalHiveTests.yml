@@ -1,5 +1,6 @@
-# Runs the sqllogictests against a metastore kept in a DuckDB database (no servers) and against a Hive Metastore with
-# S3 (scripts/hive_metastore/docker-compose.yml). A release build with DuckDB's assertions on.
+# Runs the sqllogictests of test/sql/hive_metastore against each metastore, one job per metastore: a metastore kept in
+# a DuckDB database (no servers), and Apache Hive's metastore (scripts/hive_metastore/docker-compose.yml). Both keep the
+# tables on the local file system. A release build with DuckDB's assertions on.
 
 name: Local Hive tests
 
@@ -11,8 +12,19 @@ on:
   workflow_dispatch:
 
 jobs:
-  local-hive-tests:
+  hive-tests:
+    name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: DuckDB metastore
+            test: test-hive-duckdb
+            fixture: false
+          - name: Hive Metastore
+            test: test-hms
+            fixture: true
 
     env:
       GEN: ninja
@@ -26,8 +38,11 @@ jobs:
         uses: ./duckdb/.github/actions/cleanup_runner
 
       - uses: docker/setup-compose-action@v1
+        if: matrix.fixture
 
-      - name: Start the Hive Metastore and its S3
+      # starts while the extension builds
+      - name: Start the Hive Metastore
+        if: matrix.fixture
         run: make hive-fixture
 
       - name: Install build dependencies
@@ -35,10 +50,12 @@ jobs:
           sudo apt-get update -y -qq
           sudo apt-get install -y -qq ninja-build
 
+      # one cache for both jobs: they build the same
       - name: Setup Ccache
         uses: ./duckdb/.github/actions/ccache-action
         with:
-          save: ${{ github.ref == 'refs/heads/main' }}
+          key: local-hive-tests
+          save: ${{ github.ref == 'refs/heads/main' && !matrix.fixture }}
 
       - name: Build
         uses: duckdb/duckdb-ci/build-duckdb@main
@@ -47,12 +64,9 @@ jobs:
           build: make release EXT_RELEASE_FLAGS="-DFORCE_ASSERT=1"
           vcpkg-commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # Release 2026.06.2
 
-      - name: Run tests (DuckDB metastore)
-        run: make test-hive-duckdb
-
-      - name: Run tests (Hive Metastore)
-        run: make test-hms
+      - name: Run tests
+        run: make ${{ matrix.test }}
 
       - name: Metastore logs
-        if: always()
+        if: always() && matrix.fixture
         run: docker compose -f scripts/hive_metastore/docker-compose.yml logs --no-color metastore | tail -200

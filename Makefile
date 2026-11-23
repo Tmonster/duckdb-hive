@@ -4,8 +4,8 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 EXT_NAME=hive
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
-# Extensions needed for testing: parquet for the tables, httpfs for S3 against the Hive Metastore fixture
-CORE_EXTENSIONS='httpfs;parquet;json'
+# Extensions needed for testing: parquet and json for the tables
+CORE_EXTENSIONS='parquet;json'
 
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
@@ -15,7 +15,10 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # `make hive-fixture` first)
 HIVE_COMPOSE=docker compose -f scripts/hive_metastore/docker-compose.yml
 TEST_BUILD ?= release
+# the metastore creates directories below the warehouse, DuckDB writes files into them: both need to write there
+HIVE_WAREHOUSE_DIR=/tmp/duckdb-hive-warehouse
 hive-fixture:
+	mkdir -p $(HIVE_WAREHOUSE_DIR) && chmod 777 $(HIVE_WAREHOUSE_DIR)
 	$(HIVE_COMPOSE) up -d --wait
 hive-fixture-down:
 	$(HIVE_COMPOSE) down -v --remove-orphans

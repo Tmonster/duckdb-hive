@@ -1,49 +1,21 @@
-# A Hive Metastore (Thrift, port 9083, no SASL) with S3 (SeaweedFS, port 9200) for the tests of test/sql/hive_metastore
-# against test/configs/local_hms.json (`make hive-fixture`):
-#   docker compose -f scripts/hive_metastore/docker-compose.yml up -d --wait
-# The metastore keeps its tables in an embedded Derby database and reaches S3 through Hadoop's S3A (core-site.xml): it
-# creates the directories of the databases and tables it registers.
+# A Hive Metastore (Thrift, port 9083, no SASL) for the tests of test/sql/hive_metastore against
+# test/configs/local_hms.json (`make hive-fixture`). The tables live on the local file system: the warehouse directory
+# is mounted at the same path inside the container, because the metastore creates the directories of the databases and
+# tables it registers, and DuckDB writes their files there.
+# The metastore keeps its tables in an embedded Derby database.
 name: duckdb-hive-metastore
 services:
-  s3:
-    image: chrislusf/seaweedfs:4.47
-    container_name: hive-s3
-    ports:
-      - "127.0.0.1:9200:8333"
-    volumes:
-      - ../seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
-    # small volumes: the default 30 GB ones need that much free disk before the first write
-    command: ["server", "-dir=/data", "-ip.bind=0.0.0.0", "-master.volumeSizeLimitMB=64", "-volume.max=32", "-s3",
-              "-s3.port=8333", "-s3.config=/etc/seaweedfs/s3.json"]
-  init:
-    image: amazon/aws-cli:latest
-    container_name: hive-init
-    depends_on:
-      - s3
-    environment:
-      - AWS_ACCESS_KEY_ID=minio
-      - AWS_SECRET_ACCESS_KEY=minio123
-      - AWS_DEFAULT_REGION=us-east-1
-      - AWS_EC2_METADATA_DISABLED=true
-    entrypoint: |
-      /bin/sh -c "
-      until aws --endpoint-url http://s3:8333 s3 ls > /dev/null 2>&1; do echo 'waiting for S3'; sleep 1; done;
-      aws --endpoint-url http://s3:8333 s3 mb s3://hive-test 2>/dev/null || true"
   metastore:
     image: apache/hive:4.0.1
     container_name: hive-metastore
-    depends_on:
-      init:
-        condition: service_completed_successfully
     ports:
       - "127.0.0.1:9083:9083"
     environment:
       - SERVICE_NAME=metastore
       - HIVE_CUSTOM_CONF_DIR=/hive_custom_conf
-      # S3A and the AWS SDK it needs ship with Hadoop, but are not on the metastore's class path
-      - HADOOP_CLASSPATH=/opt/hadoop/share/hadoop/tools/lib/*
     volumes:
       - ./conf:/hive_custom_conf:ro
+      - /tmp/duckdb-hive-warehouse:/tmp/duckdb-hive-warehouse
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9083'"]
       interval: 5s

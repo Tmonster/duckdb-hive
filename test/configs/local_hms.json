@@ -1,11 +1,9 @@
 {
-  "description": "Hive catalogs over the Hive Metastore (Thrift) and S3 (SeaweedFS) of scripts/hive_metastore/docker-compose.yml",
-  "on_init": "CREATE SECRET (TYPE S3, KEY_ID 'minio', SECRET 'minio123', REGION 'us-east-1', ENDPOINT 'localhost:9200', USE_SSL false, URL_STYLE 'path');",
+  "description": "Hive catalogs over the Hive Metastore (Thrift) of scripts/hive_metastore/docker-compose.yml, with the tables on the local file system below the warehouse directory it mounts",
   "statically_loaded_extensions": [
     "core_functions",
     "parquet",
     "json",
-    "httpfs",
     "hive"
   ],
   "test_env": [
@@ -19,7 +17,7 @@
     },
     {
       "env_name": "HIVE_WAREHOUSE",
-      "env_value": "s3://hive-test/warehouse/{TEST_DIR}"
+      "env_value": "/tmp/duckdb-hive-warehouse/{TEST_DIR}"
     }
   ],
   "skip_tests": [],
