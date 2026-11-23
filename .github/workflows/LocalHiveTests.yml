@@ -57,11 +57,12 @@ jobs:
           key: local-hive-tests
           save: ${{ github.ref == 'refs/heads/main' && !matrix.fixture }}
 
+      # two links at a time: a release build links four by default, which can exhaust the runner's memory
       - name: Build
         uses: duckdb/duckdb-ci/build-duckdb@main
         with:
           build-type: release
-          build: make release EXT_RELEASE_FLAGS="-DFORCE_ASSERT=1"
+          build: make release EXT_RELEASE_FLAGS="-DFORCE_ASSERT=1 -DDUCKDB_RELEASE_LINK_JOBS=2"
           vcpkg-commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # Release 2026.06.2
 
       - name: Run tests
