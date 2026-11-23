@@ -1,0 +1,73 @@
+# Runs the sqllogictests of test/sql/hive_metastore against each metastore, one job per metastore: a metastore kept in
+# a DuckDB database (no servers), and Apache Hive's metastore (scripts/hive_metastore/docker-compose.yml). Both keep the
+# tables on the local file system. A release build with DuckDB's assertions on.
+
+name: Local Hive tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hive-tests:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: DuckDB metastore
+            test: test-hive-duckdb
+            fixture: false
+          - name: Hive Metastore
+            test: test-hms
+            fixture: true
+
+    env:
+      GEN: ninja
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        uses: ./duckdb/.github/actions/cleanup_runner
+
+      - uses: docker/setup-compose-action@v1
+        if: matrix.fixture
+
+      # starts while the extension builds
+      - name: Start the Hive Metastore
+        if: matrix.fixture
+        run: make hive-fixture
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -qq ninja-build
+
+      # one cache for both jobs: they build the same
+      - name: Setup Ccache
+        uses: ./duckdb/.github/actions/ccache-action
+        with:
+          key: local-hive-tests
+          save: ${{ github.ref == 'refs/heads/main' && !matrix.fixture }}
+
+      # two links at a time: a release build links four by default, which can exhaust the runner's memory
+      - name: Build
+        uses: duckdb/duckdb-ci/build-duckdb@main
+        with:
+          build-type: release
+          build: make release EXT_RELEASE_FLAGS="-DFORCE_ASSERT=1 -DDUCKDB_RELEASE_LINK_JOBS=2"
+          vcpkg-commit: cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3 # Release 2026.06.2
+
+      - name: Run tests
+        run: make ${{ matrix.test }}
+
+      - name: Metastore logs
+        if: always() && matrix.fixture
+        run: docker compose -f scripts/hive_metastore/docker-compose.yml logs --no-color metastore | tail -200

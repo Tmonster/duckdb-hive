@@ -1,0 +1,34 @@
+#pragma once
+
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
+
+namespace duckdb {
+class ClientContext;
+
+//! Conversion between Hive type strings and DuckDB logical types
+struct HiveTypes {
+	//! Parse a Hive column type string, e.g. 'int', 'decimal(10,2)', 'array<string>', 'struct<a:int,b:string>'
+	static LogicalType ToLogicalType(const string &hive_type);
+	//! Produce a Hive column type string from a DuckDB logical type
+	static string FromLogicalType(const LogicalType &type);
+	//! A view column's Hive type: the closest type Hive, Trino and Spark all parse, else 'string'. Never throws.
+	static string FromLogicalTypeForView(const LogicalType &type);
+
+	//! HivePartitioning::GetValue without the unescaping: the metastore stores the raw value, so 'a%20b' stays 'a%20b',
+	//! not 'a b'. Throws if the value can't be cast to the key's type.
+	static Value PartitionValue(ClientContext &context, const string &key, const string &str_value,
+	                            const LogicalType &type);
+	//! Whether PartitionValue reads the value the metastore stores as NULL: Hive's default partition name, and for a
+	//! non-string key the spellings a NULL arrives as
+	static bool PartitionValueIsNull(const string &str_value, const LogicalType &type);
+	//! Whether values a partition declares as 'from' can be read as the table's type 'to': the changes the extension's
+	//! own DDL allows, and DuckDB's implicit casts. Nested types are left to the reader.
+	static bool CanReadPartitionTypeAs(ClientContext &context, const LogicalType &from, const LogicalType &to);
+	//! Whether two Hive column types read as the same DuckDB type, so 'int' and 'integer' agree; types that do not
+	//! parse are compared as Hive compares them, ignoring case and whitespace
+	static bool SameColumnType(const string &a, const string &b);
+};
+
+} // namespace duckdb

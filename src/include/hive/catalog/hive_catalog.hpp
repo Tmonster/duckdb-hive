@@ -1,0 +1,134 @@
+#pragma once
+
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/enums/access_mode.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/optional.hpp"
+
+#include "hive/catalog/hive_options.hpp"
+#include "hive/catalog/hive_schema_set.hpp"
+
+namespace duckdb {
+class HiveMetastore;
+class HiveTable;
+
+//! The outcome of looking a table up before its schema (HiveCatalog::TryLookupTableBeforeSchema)
+enum class TableLookup : uint8_t {
+	//! the schema is already held, or was added meanwhile: the regular lookup runs
+	SKIPPED,
+	//! the table exists, so its schema does too
+	TABLE_FOUND,
+	//! the schema exists, the table does not
+	TABLE_NOT_FOUND,
+	//! the schema does not exist
+	SCHEMA_NOT_FOUND
+};
+
+class HiveCatalog : public Catalog {
+public:
+	explicit HiveCatalog(AttachedDatabase &db_p, AccessMode access_mode, HiveAttachOptions options);
+	~HiveCatalog() override;
+
+public:
+	//! The metastore is set right after construction, as it refers back to the catalog
+	void SetMetastore(unique_ptr<HiveMetastore> metastore_p);
+	HiveMetastore &Metastore() const;
+	//! The metastore has no transactions: throw on DDL or INSERT inside an explicit (BEGIN) transaction
+	static void ThrowIfInExplicitTransaction(ClientContext &context);
+	//! The same for a hive_* function that changes the metastore, naming it in the error
+	static void ThrowIfInExplicitTransaction(ClientContext &context, const char *function);
+	//! Whether 'catalog' is a Hive catalog, of any metastore
+	static bool IsHiveCatalog(Catalog &catalog);
+	//! Throw for a metastore change ('operation') on a read-only attach
+	void CheckWritable(const string &operation) const;
+
+	void Initialize(bool load_builtin) override;
+	string GetCatalogType() override;
+	//! Functions are never looked up in a Hive catalog
+	CatalogLookupBehavior CatalogTypeLookupRule(CatalogType type) const override {
+		switch (type) {
+		case CatalogType::TABLE_FUNCTION_ENTRY:
+		case CatalogType::SCALAR_FUNCTION_ENTRY:
+		case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+			return CatalogLookupBehavior::NEVER_LOOKUP;
+		default:
+			return CatalogLookupBehavior::STANDARD;
+		}
+	}
+	bool CheckAmbiguousCatalogOrSchema(ClientContext &context, const Identifier &schema) override {
+		return false;
+	}
+	optional<Identifier> GetDefaultSchema() const override;
+	//! Allow CREATE TABLE ... PARTITIONED BY (...) WITH (location = '...', <property> = '...'); the options are
+	//! validated in HiveSchemaEntry::CreateTable
+	ErrorData SupportsCreateTable(BoundCreateTableInfo &info) override;
+	//! Allow CREATE SCHEMA ... WITH (comment = '...', location = '...', <parameter> = '...'), applied in CreateSchema
+	ErrorData SupportsCreateSchema(CreateSchemaInfo &info) override;
+	void AlterSchema(CatalogTransaction transaction, SchemaCatalogEntry &schema, AlterSchemaInfo &info) override;
+
+	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
+	void DropSchema(ClientContext &context, DropInfo &info) override;
+	void OnDetach(ClientContext &context) override;
+	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
+	//! Serves a single-name equality on schema_name with one database lookup instead of listing every database
+	vector<reference<SchemaCatalogEntry>> GetSchemasForScan(ClientContext &context,
+	                                                        const SchemaScanFilters &filters) override;
+	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction transaction, const EntryLookupInfo &schema_lookup,
+	                                              OnEntryNotFound if_not_found) override;
+	HiveSchemaSet &GetSchemas();
+	//! The S3 location a new database gets: <default_location>/<database>, or none when there is no DEFAULT_LOCATION
+	string GetDatabaseLocation(const string &database_name) const;
+	//! The S3 location a new table gets when none is given: <default_location>/<database>/<table> when the catalog
+	//! was attached with DEFAULT_LOCATION, else <database LocationUri>/<table>; throws when neither is available
+	string GetTableLocation(const HiveDatabaseInfo &database, const string &table_name) const;
+
+	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+	                             optional_ptr<PhysicalOperator> plan) override;
+	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
+	                                    PhysicalOperator &plan) override;
+	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+	                             PhysicalOperator &plan) override;
+	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+	                             PhysicalOperator &plan) override;
+	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
+	                                PhysicalOperator &plan) override;
+	unique_ptr<LogicalOperator> BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,
+	                                            unique_ptr<LogicalOperator> plan) override;
+
+	DatabaseSize GetDatabaseSize(ClientContext &context) override;
+	bool InMemory() override;
+	string GetDBPath() override;
+
+public:
+	AccessMode access_mode;
+	HiveAttachOptions options;
+
+	//! Whether 'catalog' is the one ICEBERG_CATALOG names; throws if it is not an Iceberg catalog over this one
+	bool IsIcebergCatalog(Catalog &catalog);
+	//! Whether the metastore registers db.table of this catalog as an Iceberg table, looked up without expanding views
+	bool IsIcebergTable(ClientContext &context, const Identifier &schema_name, const Identifier &table_name);
+
+private:
+	//! Throw unless the metastore's current definition of 'table' (returned in 'table_info') is a Hive table DuckDB
+	//! writes
+	static HiveTable &GetHiveTableForDML(ClientContext &context, TableCatalogEntry &table, const char *statement,
+	                                     HiveTableInfo &table_info);
+	//! Apply one CREATE / ALTER SCHEMA option: 'comment' is the Description, 'location' the LocationUri and any other
+	//! key a database parameter
+	void SetDatabaseOption(HiveDatabaseInfo &database, const string &key, const Value &value) const;
+
+	//! Looks a table up before its database: finding the table proves the database exists, saving GetDatabase
+	CatalogEntryLookup TryLookupEntryInternal(CatalogTransaction transaction,
+	                                          const EntryLookupInfo &lookup_info) override;
+	//! Looks the table up before its schema; with SKIPPED the regular lookup runs instead
+	TableLookup TryLookupTableBeforeSchema(CatalogTransaction transaction, const EntryLookupInfo &lookup_info,
+	                                       const string &database_name, CatalogEntryLookup &result);
+	//! A Hive view found by a table lookup is read with its Iceberg tables mapped (HiveView::ForReading)
+	CatalogEntryLookup ViewForReading(CatalogTransaction transaction, CatalogEntryLookup result);
+
+private:
+	HiveSchemaSet schemas;
+	unique_ptr<HiveMetastore> metastore;
+};
+
+} // namespace duckdb

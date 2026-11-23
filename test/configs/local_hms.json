@@ -1,0 +1,25 @@
+{
+  "description": "Hive catalogs over the Hive Metastore (Thrift) of scripts/hive_metastore/docker-compose.yml, with the tables on the local file system below the warehouse directory it mounts",
+  "statically_loaded_extensions": [
+    "core_functions",
+    "parquet",
+    "json",
+    "hive"
+  ],
+  "test_env": [
+    {
+      "env_name": "HIVE_TEST_CONFIG",
+      "env_value": "thrift"
+    },
+    {
+      "env_name": "HIVE_METASTORE_URI",
+      "env_value": "thrift://localhost:9083"
+    },
+    {
+      "env_name": "HIVE_WAREHOUSE",
+      "env_value": "/tmp/duckdb-hive-warehouse/{TEST_DIR}"
+    }
+  ],
+  "skip_tests": [],
+  "skip_error_messages": []
+}

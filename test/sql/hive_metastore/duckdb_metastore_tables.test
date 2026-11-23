@@ -1,0 +1,97 @@
+# name: test/sql/hive_metastore/duckdb_metastore_tables.test
+# description: The metastore kept in a DuckDB database is a set of plain tables: what a Hive catalog writes there can be
+# group: [hive_metastore]
+
+# read as SQL, and a table registered there with SQL is read by the catalog
+
+require parquet
+
+require hive
+
+require-env HIVE_TEST_CONFIG duckdb
+
+require-env HIVE_METASTORE_URI
+
+require-env HIVE_WAREHOUSE
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_LOCATION '{HIVE_WAREHOUSE}');
+
+statement ok
+DROP SCHEMA IF EXISTS hms.raw CASCADE;
+
+statement ok
+CREATE SCHEMA hms.raw WITH (comment = 'raw data');
+
+statement ok
+CREATE TABLE hms.raw.clicks (id INTEGER, page VARCHAR, dt VARCHAR) PARTITIONED BY (dt);
+
+statement ok
+INSERT INTO hms.raw.clicks VALUES (1, '/', '2024-01-01'), (2, '/about', '2024-01-02');
+
+statement ok
+DETACH hms;
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS meta (READ_ONLY);
+
+query TT
+SELECT name, description FROM meta.dbs;
+----
+raw	raw data
+
+query TTTTT
+SELECT tbl_name, tbl_type, serde_lib, [c.name FOR c IN cols], [k.name FOR k IN partition_keys] FROM meta.tbls;
+----
+clicks	EXTERNAL_TABLE	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	[id, page]	[dt]
+
+query TT
+SELECT part_values, location LIKE '%/clicks/dt=' || part_values[1] FROM meta.partitions ORDER BY ALL;
+----
+[2024-01-01]	true
+[2024-01-02]	true
+
+statement ok
+DETACH meta;
+
+# a table another tool registered: a parquet file and a row in tbls
+statement ok
+COPY (SELECT 42 AS answer) TO '{HIVE_WAREHOUSE}/by_hand' (FORMAT parquet, PER_THREAD_OUTPUT true);
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS meta;
+
+statement ok
+INSERT INTO meta.tbls (db_name, tbl_name, tbl_type, create_time, version, parameters, location, input_format,
+    output_format, serde_lib, serde_params, cols, partition_keys, bucket_cols, num_buckets, sort_cols)
+VALUES ('raw', 'by_hand', 'EXTERNAL_TABLE', 0, 1, MAP {'EXTERNAL': 'TRUE'}, '{HIVE_WAREHOUSE}/by_hand',
+    'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat',
+    'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat',
+    'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe', MAP {}, [{'name': 'answer', 'type': 'int', 'comment': NULL}],
+    [], [], -1, []);
+
+statement ok
+DETACH meta;
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive);
+
+query I
+SELECT answer FROM hms.raw.by_hand;
+----
+42
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'hms' ORDER BY ALL;
+----
+by_hand
+clicks
+
+# a file that is not a metastore database
+statement ok
+DETACH hms;
+
+statement error
+ATTACH '{HIVE_WAREHOUSE}/by_hand/data_0.parquet' AS not_a_metastore (TYPE hive);
+----
+Could not open the Hive metastore database

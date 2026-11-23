@@ -1,0 +1,157 @@
+# name: test/sql/hive_metastore/ddl.test
+# description: Schemas, tables and their properties in a Hive metastore catalog
+# group: [hive_metastore]
+
+require parquet
+
+require hive
+
+require-env HIVE_METASTORE_URI
+
+require-env HIVE_WAREHOUSE
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_LOCATION '{HIVE_WAREHOUSE}');
+
+statement ok
+DROP SCHEMA IF EXISTS hms.hms_ddl CASCADE;
+
+statement ok
+CREATE SCHEMA hms.hms_ddl WITH (comment = 'the DDL test', owner_team = 'data');
+
+statement error
+CREATE SCHEMA hms.hms_ddl;
+----
+already exists
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS hms.hms_ddl;
+
+query TT
+SELECT description, location_uri LIKE '%/hms_ddl' FROM hive_get_database_response('hms.hms_ddl');
+----
+the DDL test	true
+
+query T
+SELECT parameters['owner_team'] FROM hive_get_database_response('hms.hms_ddl');
+----
+data
+
+statement ok
+CREATE TABLE hms.hms_ddl.events (id BIGINT, name VARCHAR, tags VARCHAR[], payload STRUCT(a INTEGER, b DOUBLE), dt DATE)
+PARTITIONED BY (dt) WITH (comment = 'all events', 'retention.days' = '30');
+
+query TT
+SELECT column_name, data_type FROM duckdb_columns() WHERE database_name = 'hms' AND table_name = 'events' ORDER BY column_index;
+----
+id	BIGINT
+name	VARCHAR
+tags	VARCHAR[]
+payload	STRUCT(a INTEGER, b DOUBLE)
+dt	DATE
+
+query TTT
+SELECT response.StorageDescriptor.InputFormat::VARCHAR, serde_library, parameters['retention.days'] FROM hive_get_table_response('hms.hms_ddl.events');
+----
+org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat	org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe	30
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'hms' AND table_name = 'events';
+----
+all events
+
+statement error
+CREATE TABLE hms.hms_ddl.events (id BIGINT);
+----
+already exists
+
+statement ok
+CREATE TABLE IF NOT EXISTS hms.hms_ddl.events (id BIGINT);
+
+statement ok
+COMMENT ON TABLE hms.hms_ddl.events IS 'every event';
+
+statement ok
+COMMENT ON COLUMN hms.hms_ddl.events.name IS 'who';
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'hms' AND table_name = 'events';
+----
+every event
+
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'hms' AND table_name = 'events' AND column_name = 'name';
+----
+who
+
+statement ok
+ALTER TABLE hms.hms_ddl.events ADD COLUMN score DOUBLE;
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'hms' AND table_name = 'events' ORDER BY column_index;
+----
+id
+name
+tags
+payload
+score
+dt
+
+statement ok
+ALTER TABLE hms.hms_ddl.events SET (owner = 'analytics');
+
+query T
+SELECT parameters['owner'] FROM hive_get_table_response('hms.hms_ddl.events');
+----
+analytics
+
+# text formats
+statement ok
+CREATE TABLE hms.hms_ddl.csv_table (id INTEGER, name VARCHAR) WITH (format = 'csv', delimiter = '|');
+
+query TT
+SELECT serde_library, parameters['classification'] FROM hive_get_table_response('hms.hms_ddl.csv_table');
+----
+org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe	csv
+
+statement ok
+CREATE TABLE hms.hms_ddl.json_table (id INTEGER, name VARCHAR) WITH (format = 'json');
+
+query T
+SELECT serde_library FROM hive_get_table_response('hms.hms_ddl.json_table');
+----
+org.apache.hive.hcatalog.data.JsonSerDe
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'hms' AND schema_name = 'hms_ddl' ORDER BY table_name;
+----
+csv_table
+events
+json_table
+
+statement ok
+DROP TABLE hms.hms_ddl.json_table;
+
+statement error
+SELECT * FROM hms.hms_ddl.json_table;
+----
+does not exist
+
+statement ok
+DROP TABLE IF EXISTS hms.hms_ddl.json_table;
+
+statement error
+DROP SCHEMA hms.hms_ddl;
+----
+still contains tables
+
+statement ok
+DROP SCHEMA hms.hms_ddl CASCADE;
+
+statement error
+CREATE TABLE hms.hms_ddl.again (i INTEGER);
+----
+does not exist
+
+statement ok
+DROP SCHEMA IF EXISTS hms.hms_ddl;

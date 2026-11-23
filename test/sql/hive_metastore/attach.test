@@ -1,0 +1,135 @@
+# name: test/sql/hive_metastore/attach.test
+# description: ATTACH ... (TYPE hive) for a Hive metastore (thrift://) or a metastore kept in a DuckDB database
+# group: [hive_metastore]
+
+require parquet
+
+require hive
+
+require-env HIVE_METASTORE_URI
+
+require-env HIVE_WAREHOUSE
+
+statement error
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, REGION 'us-east-1');
+----
+Unrecognized option for Hive attach: 'region'
+
+statement error
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, ICEBERG_CATALOG 'ice');
+----
+ICEBERG_CATALOG is not supported for Hive metastore catalogs
+
+statement error
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_SCHEMA 'hms_attach_missing');
+----
+default_schema 'hms_attach_missing' does not exist in Hive metastore catalog
+
+# nothing listens on port 1: the attach fails unless the connection is not verified
+statement error
+ATTACH 'thrift://127.0.0.1:1' AS unreachable (TYPE hive);
+----
+Could not connect to the Hive metastore at 127.0.0.1:1
+
+statement error
+ATTACH 'thrift://:9083' AS no_host (TYPE hive);
+----
+names no host
+
+statement error
+ATTACH 'thrift://localhost:port' AS bad_port (TYPE hive);
+----
+Invalid port in Hive metastore URI
+
+statement error
+ATTACH 'thrift://localhost:9083' AS bad_timeout (TYPE hive, TIMEOUT 0);
+----
+TIMEOUT must be a positive number of seconds
+
+statement ok
+ATTACH 'thrift://127.0.0.1:1' AS unreachable (TYPE hive, VERIFY_CONNECTION false);
+
+statement error
+SHOW ALL TABLES;
+----
+Could not connect to the Hive metastore at 127.0.0.1:1
+
+statement ok
+DETACH unreachable;
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_LOCATION '{HIVE_WAREHOUSE}');
+
+query TT
+SELECT type, path = '{HIVE_METASTORE_URI}' FROM duckdb_databases() WHERE database_name = 'hms';
+----
+hive	true
+
+statement ok
+DROP SCHEMA IF EXISTS hms.hms_attach CASCADE;
+
+statement ok
+CREATE SCHEMA hms.hms_attach;
+
+statement ok
+DETACH hms;
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, DEFAULT_SCHEMA 'hms_attach', DEFAULT_LOCATION '{HIVE_WAREHOUSE}');
+
+statement ok
+CREATE TABLE hms.t (i INTEGER);
+
+statement ok
+INSERT INTO hms.t VALUES (1), (2);
+
+query I
+SELECT sum(i) FROM hms.hms_attach.t;
+----
+3
+
+# a read-only attach reads and refuses changes
+statement ok
+DETACH hms;
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive, READ_ONLY);
+
+query I
+SELECT sum(i) FROM hms.hms_attach.t;
+----
+3
+
+statement error
+INSERT INTO hms.hms_attach.t VALUES (3);
+----
+read-only
+
+statement error
+CREATE SCHEMA hms.hms_attach_ro;
+----
+read-only
+
+statement error
+CALL hive_set_table_location('hms.hms_attach.t', '{HIVE_WAREHOUSE}/elsewhere');
+----
+read-only
+
+statement ok
+DETACH hms;
+
+statement ok
+ATTACH '{HIVE_METASTORE_URI}' AS hms (TYPE hive);
+
+statement ok
+DROP SCHEMA hms.hms_attach CASCADE;
+
+statement error
+ATTACH 'thrift://[::1' AS bad_ipv6 (TYPE hive);
+----
+Invalid host in Hive metastore URI
+
+statement error
+ATTACH 'thrift://localhost:99999' AS bad_port (TYPE hive);
+----
+Invalid port in Hive metastore URI

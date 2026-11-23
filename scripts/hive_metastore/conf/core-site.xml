@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<configuration>
+  <!-- the directories the metastore creates are written by DuckDB, which runs as another user -->
+  <property><name>fs.permissions.umask-mode</name><value>000</value></property>
+</configuration>

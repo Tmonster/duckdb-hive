@@ -1,0 +1,23 @@
+# A Hive Metastore (Thrift, port 9083, no SASL) for the tests of test/sql/hive_metastore against
+# test/configs/local_hms.json (`make hive-fixture`). The tables live on the local file system: the warehouse directory
+# is mounted at the same path inside the container, because the metastore creates the directories of the databases and
+# tables it registers, and DuckDB writes their files there.
+# The metastore keeps its tables in an embedded Derby database.
+name: duckdb-hive-metastore
+services:
+  metastore:
+    image: apache/hive:4.0.1
+    container_name: hive-metastore
+    ports:
+      - "127.0.0.1:9083:9083"
+    environment:
+      - SERVICE_NAME=metastore
+      - HIVE_CUSTOM_CONF_DIR=/hive_custom_conf
+    volumes:
+      - ./conf:/hive_custom_conf:ro
+      - /tmp/duckdb-hive-warehouse:/tmp/duckdb-hive-warehouse
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/9083'"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
